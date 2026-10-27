@@ -182,6 +182,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
+from .text_admission import TelegramTextAdmissionMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from plugins.platforms.telegram.telegram_network import (
@@ -515,7 +516,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramTextAdmissionMixin, TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -587,6 +588,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         extra = self.config.extra
         self._app: Optional[Application] = None
         self._seen_update_ids: dict = {}
+        self._latest_text_receipts: dict = {}
+        self._text_message_locks: dict = {}
         self._inflight_update_ids: dict = {}
         self._update_admission = None
         # Completed update IDs survive adapter replacement and restarts (update_admission.py).
@@ -2877,6 +2880,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         claim = admission.get() if admission is not None else None
         if claim is not None:
             claim.accepted = True
+            if claim.text_receipt is not None and claim.text_task is asyncio.current_task():
+                from .update_admission import accept_text
+                accept_text(self, claim)
 
     def _fail_update_preparation(self) -> None:
         """A caught preparation error is not a successful no-op or an auth refusal."""
@@ -3191,7 +3197,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
-            from plugins.platforms.telegram.update_admission import TelegramApplication, build_update_processor
+            from .update_admission import TelegramApplication, build_update_processor
             builder = Application.builder().token(self.config.token)
             builder.application_class(TelegramApplication, {"adapter": self})
             custom_base_url = self.config.extra.get("base_url")
@@ -6480,48 +6486,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if self._should_observe_unmentioned_group_message(msg):
             self._observe_unmentioned_group_message(msg, msg_type, update_id=update.update_id)
         return False
-
-    async def _build_triggered_event(self, msg, update, msg_type: MessageType) -> MessageEvent:
-        """Event for an addressed text/command: trigger text cleaned (sole addressee only), replied-to
-        media cached, attribution applied."""
-        from plugins.platforms.telegram.telegram_context import group_trigger_text
-        event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        event.text = group_trigger_text(self, msg, event.text)
-        await self._cache_replied_media(msg, event)
-        return self._apply_telegram_group_observe_attribution(event)
-
-    async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming text; buffers client-split chunks into one MessageEvent."""
-        msg = self._effective_update_message(update)
-        if not msg or not msg.text:
-            return
-        # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
-        if not self._is_user_authorized_from_message(msg):
-            self._log_blocked_user(msg)
-            return
-        if not self._gate_or_observe(msg, update, MessageType.TEXT):
-            return
-        await self._ensure_forum_commands(update.message)
-        self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
-
-    async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming command messages."""
-        msg = self._effective_update_message(update)
-        if not msg or not msg.text:
-            return
-        if not self._should_process_message(msg, is_command=True):
-            return
-        if not self._is_user_authorized_from_message(msg):
-            self._log_blocked_user(msg)
-            return
-        await self._ensure_forum_commands(msg)
-        event = await self._build_triggered_event(msg, update, MessageType.COMMAND)
-        # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
-        # immediately would orphan them. Near-limit commands go through text batching.
-        if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            self._enqueue_text_event(event)
-            return
-        await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""

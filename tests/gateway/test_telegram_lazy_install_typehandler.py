@@ -14,7 +14,9 @@ The test drives the real transition rather than asserting on one name, so it
 also catches the next symbol that gets dropped from the rebind list.
 """
 
+import subprocess
 import sys
+import textwrap
 import types
 from typing import Any
 
@@ -146,3 +148,52 @@ def test_lazy_install_rebinds_every_placeholder(monkeypatch, fake_telegram_sdk):
     assert adapter.TypeHandler is fake_telegram_sdk["TypeHandler"]
     assert adapter.Update is fake_telegram_sdk["Update"]
     assert adapter.TelegramMessageHandler is fake_telegram_sdk["MessageHandler"]
+
+
+def test_adapter_imports_without_sdk_then_uses_existing_lazy_rebind():
+    """A cold import must reach the normal installer, even with no Telegram SDK."""
+    code = textwrap.dedent("""
+        import importlib.abc
+        import sys
+        from typing import Any
+        import pytest
+        from tests.gateway.test_telegram_lazy_install_typehandler import fake_telegram_sdk
+
+        class MissingTelegram(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "telegram" or fullname.startswith("telegram."):
+                    raise ModuleNotFoundError("Telegram SDK unavailable", name=fullname)
+
+        assert not any(n == "telegram" or n.startswith("telegram.") for n in sys.modules)
+        blocker = MissingTelegram()
+        sys.meta_path.insert(0, blocker)
+        from plugins.platforms.telegram import adapter
+        assert adapter.TELEGRAM_AVAILABLE is False
+        assert adapter.telegram_deps_present() is False
+        assert adapter.Update is Any
+
+        import pm
+        calls, sdk = [], {}
+        with pytest.MonkeyPatch.context() as patch:
+            def provide_sdk(extra):
+                calls.append(extra)
+                assert extra == "telegram"
+                sys.meta_path.remove(blocker)
+                sdk.update(fake_telegram_sdk.__wrapped__(patch))
+
+            patch.setattr(pm, "ensure_import", provide_sdk)
+            assert adapter.telegram_deps_present() is False
+            assert calls == []
+            assert adapter.check_telegram_requirements() is True
+            assert adapter.TELEGRAM_AVAILABLE is True
+            assert adapter.telegram_deps_present() is True
+            assert adapter.Update is sdk["Update"]
+            assert adapter.TypeHandler is sdk["TypeHandler"]
+            assert adapter.TelegramMessageHandler is sdk["MessageHandler"]
+            assert adapter.check_telegram_requirements() is True
+            assert calls == ["telegram"]
+        print("cold import and lazy SDK rebinding passed")
+    """)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cold import and lazy SDK rebinding passed" in result.stdout
